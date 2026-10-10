@@ -10,6 +10,7 @@ import importlib.util
 from pathlib import Path
 from urllib.parse import urlparse
 
+# ==== Автоустановка зависимостей (как в оригинале) ====
 def ensure_package(module_name, package_name):
     if importlib.util.find_spec(module_name) is None:
         subprocess.check_call([
@@ -18,19 +19,7 @@ def ensure_package(module_name, package_name):
         ])
 
 ensure_package("telebot", "pyTelegramBotAPI")
-
-# Обновляем yt-dlp до последней версии при запуске
-subprocess.check_call([
-    __import__("sys").executable, "-m", "pip", "install", "--upgrade",
-    "--no-cache-dir", "--disable-pip-version-check", "--pre", "yt-dlp[default]"
-])
-try:
-    import yt_dlp_ejs  # noqa: F401
-except ImportError:
-    subprocess.check_call([
-        __import__("sys").executable, "-m", "pip", "install", "--upgrade",
-        "--no-cache-dir", "--disable-pip-version-check", "yt-dlp-ejs"
-    ])
+ensure_package("yt_dlp", "yt-dlp")
 
 import telebot
 from telebot import types
@@ -45,7 +34,6 @@ if not TOKEN:
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-# Размер одного куска при нарезке (чуть меньше лимита Telegram)
 SEGMENT_SIZE_MB = int(os.getenv("SEGMENT_SIZE_MB", "45"))
 
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", tempfile.gettempdir())) / "media_downloader_bot"
@@ -162,7 +150,9 @@ def progress_hook(chat_id, message_id):
 
 
 def split_video(input_file: Path, workdir: Path, segment_mb: int = 45):
-    """Режет видео на куски по segment_mb мегабайт без перекодирования."""
+    """Режет видео на куски по segment_mb мегабайт."""
+    if not is_ffmpeg_available():
+        raise RuntimeError("ffmpeg не установлен")
     output_pattern = str(workdir / "part_%03d.mp4")
     cmd = [
         "ffmpeg", "-y",
@@ -174,13 +164,16 @@ def split_video(input_file: Path, workdir: Path, segment_mb: int = 45):
         "-reset_timestamps", "1",
         output_pattern,
     ]
-    log.info("Нарезка видео: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    log.info("Нарезка: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpeg завис (таймаут 180 сек)")
     if result.returncode != 0:
         log.error("FFmpeg split failed: %s", result.stderr[-1500:])
-        raise RuntimeError(f"Не удалось нарезать видео: {result.stderr[-400:]}")
+        raise RuntimeError(f"Не удалось нарезать: {result.stderr[-400:]}")
     parts = sorted(workdir.glob("part_*.mp4"))
-    log.info("Получилось частей: %d", len(parts))
+    log.info("Частей: %d", len(parts))
     return parts
 
 
@@ -189,12 +182,14 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
     try:
         cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
         if cookies_file and not Path(cookies_file).is_file():
-            log.warning("YTDLP_COOKIES_FILE is set but the file does not exist: %s", cookies_file)
+            log.warning("YTDLP_COOKIES_FILE не найден: %s", cookies_file)
             cookies_file = ""
+
         if mode == MODE_AUDIO and not is_ffmpeg_available():
             bot.send_message(
                 chat_id,
-                "На сервере не найден FFmpeg. Установи FFmpeg на хостинге и перезапусти бота."
+                "⚠️ Для MP3 нужен FFmpeg, но его нет на сервере. "
+                "Установи ffmpeg или используй режим видео."
             )
             return
 
@@ -241,30 +236,36 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
         if cookies_file:
             options["cookiefile"] = cookies_file
 
+        log.info("Начинаю скачивание: %s", url)
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
             title = clean_title(info.get("title", "media"))
+        log.info("Скачивание завершено: %s", title)
 
-        files = [p for p in workdir.iterdir() if p.is_file() and p.stat().st_size > 0 and not p.name.startswith("part_")]
+        files = [p for p in workdir.iterdir()
+                 if p.is_file() and p.stat().st_size > 0 and not p.name.startswith("part_")]
         if not files:
-            raise RuntimeError("Загрузчик не создал итоговый файл.")
+            raise RuntimeError("Загрузчик не создал файл.")
         media_file = max(files, key=lambda p: p.stat().st_size)
         size = media_file.stat().st_size
         size_mb = size / 1024 / 1024
-        log.info("Скачано: %s (%.1f МБ)", media_file.name, size_mb)
+        log.info("Файл: %s (%.1f МБ)", media_file.name, size_mb)
 
-        # ==== Если файл больше лимита — режем на части ====
+        # ==== Нарезка, если больше лимита ====
         if size > MAX_UPLOAD_BYTES:
             if mode == MODE_AUDIO:
                 bot.send_message(
                     chat_id,
-                    f"⚠️ MP3 получился слишком большим ({size_mb:.1f} МБ) и превышает лимит Telegram. "
-                    f"Попробуй другое видео или более низкое качество."
+                    f"⚠️ MP3 {size_mb:.1f} МБ больше лимита Telegram. Попробуй другое видео."
                 )
                 return
 
             if not is_ffmpeg_available():
-                bot.send_message(chat_id, "⚠️ Файл большой, но FFmpeg не установлен — не могу нарезать.")
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ Файл {size_mb:.1f} МБ больше лимита, а ffmpeg нет. "
+                    f"Установи ffmpeg или качай ниже качество."
+                )
                 return
 
             if status_message:
@@ -276,14 +277,19 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                 except Exception:
                     pass
 
-            parts = split_video(media_file, workdir, segment_mb=SEGMENT_SIZE_MB)
+            try:
+                parts = split_video(media_file, workdir, segment_mb=SEGMENT_SIZE_MB)
+            except Exception as e:
+                log.exception("Split failed")
+                bot.send_message(chat_id, f"⚠️ Нарезка не удалась: {str(e)[:400]}")
+                return
+
             if not parts:
-                raise RuntimeError("Нарезка не дала ни одного файла.")
+                raise RuntimeError("Нарезка не дала файлов.")
 
             total = len(parts)
             for i, part in enumerate(parts, 1):
-                part_mb = part.stat().st_size / 1024 / 1024
-                log.info("Отправляю часть %d/%d (%.1f МБ)", i, total, part_mb)
+                log.info("Отправляю часть %d/%d", i, total)
                 if status_message:
                     try:
                         bot.edit_message_text(
@@ -302,27 +308,30 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                     )
             bot.send_message(chat_id, "✅ Готово! Все части отправлены.", reply_markup=main_keyboard())
             return
-        # ==== Конец блока нарезки ====
 
+        # ==== Обычная отправка ====
         if status_message:
             try:
-                bot.edit_message_text("📤 Отправляю файл в Telegram…", chat_id, status_message.message_id)
+                bot.edit_message_text("📤 Отправляю файл…", chat_id, status_message.message_id)
             except Exception:
                 pass
 
         caption = f"🎵 {title}" if mode == MODE_AUDIO else f"🎬 {title}\nКачество: {VIDEO_QUALITIES[quality][0]}"
         caption = caption[:1000]
+
+        log.info("Отправляю в Telegram: %s", media_file.name)
         with media_file.open("rb") as file_obj:
             if mode == MODE_AUDIO:
-                bot.send_audio(chat_id, file_obj, caption=caption, title=title[:64], timeout=120)
+                bot.send_audio(chat_id, file_obj, caption=caption, title=title[:64], timeout=300)
             else:
                 bot.send_video(
                     chat_id, file_obj,
                     caption=caption,
                     supports_streaming=True,
-                    timeout=120,
+                    timeout=300,
                 )
-        bot.send_message(chat_id, "✅ Готово! Можешь отправить ещё одну ссылку или выбрать режим.", reply_markup=main_keyboard())
+        log.info("Отправка завершена")
+        bot.send_message(chat_id, "✅ Готово! Можешь отправить ещё одну ссылку.", reply_markup=main_keyboard())
 
     except yt_dlp.utils.DownloadError as exc:
         error_text = str(exc)
@@ -331,18 +340,10 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
         if "sign in to confirm" in lower_error or "not a bot" in lower_error:
             message = (
                 "YouTube отклонил запрос и требует авторизацию.\n\n"
-                "Это защита от ботов. Установи PO Token провайдер на сервере "
-                "(bgutil-ytdlp-pot-provider) и убедись, что он запущен."
-            )
-        elif any(site in url.lower() for site in ("instagram.com", "tiktok.com")) and any(
-            term in lower_error for term in ("login", "cookies", "private", "challenge", "403", "forbidden")
-        ):
-            message = (
-                "Instagram/TikTok отказал в доступе. Эти сайты часто требуют авторизацию. "
-                "Проверь, что ссылка на публичный ролик."
+                "Это защита от ботов. Нужен PO Token провайдер на сервере."
             )
         else:
-            message = f"Не удалось скачать материал. Ошибка загрузчика: {error_text[:650]}"
+            message = f"Не удалось скачать: {error_text[:650]}"
         try:
             bot.send_message(chat_id, message, reply_markup=main_keyboard())
         except Exception:
@@ -350,7 +351,7 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
     except Exception as exc:
         log.exception("Processing failed")
         try:
-            bot.send_message(chat_id, f"⚠️ Не получилось обработать файл: {str(exc)[:700]}", reply_markup=main_keyboard())
+            bot.send_message(chat_id, f"⚠️ Ошибка: {str(exc)[:700]}", reply_markup=main_keyboard())
         except Exception:
             pass
     finally:
@@ -367,10 +368,10 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
 def start_job(chat_id, url, mode, quality=None):
     with jobs_lock:
         if chat_id in user_jobs:
-            bot.send_message(chat_id, "⏳ У тебя уже выполняется загрузка. Дождись её завершения.")
+            bot.send_message(chat_id, "⏳ Уже идёт загрузка. Дождись.")
             return
         user_jobs[chat_id] = True
-    status = bot.send_message(chat_id, "🔎 Проверяю ссылку и доступные форматы…")
+    status = bot.send_message(chat_id, "🔎 Проверяю ссылку…")
     thread = threading.Thread(
         target=download_media,
         args=(chat_id, url, mode, quality, status),
@@ -384,28 +385,22 @@ def cmd_start(message):
     intro = (
         "Привет! Я MediaBot — бот для скачивания видео и аудио по ссылке.\n\n"
         "Что я умею:\n"
-        "🎬 Скачивать видео в доступном качестве до 1080p.\n"
-        "🎚 Предлагать выбор качества: 360p, 480p, 720p HD или 1080p Full HD.\n"
-        "🎵 Извлекать аудио из видео и отправлять его в MP3.\n"
-        "✂️ Если видео больше 49 МБ — я разрежу его на части и отправлю по очереди "
-        "(размер каждой части ~45 МБ, количество зависит от веса видео).\n"
+        "🎬 Скачивать видео до 1080p.\n"
+        "🎚 Выбор качества: 360p / 480p / 720p / 1080p.\n"
+        "🎵 Извлекать аудио в MP3.\n"
+        "✂️ Видео больше 49 МБ режется на части по ~45 МБ (если есть ffmpeg).\n"
         "🌐 Поддерживаемые сервисы:\n"
         "   • YouTube\n"
         "   • TikTok\n"
         "   • Instagram\n"
         "   • ВКонтакте (VK Видео)\n"
         "   • Rutube\n"
-        "   • и другие сайты, которые поддерживает загрузчик yt-dlp.\n"
-        "🧹 Удалять временные файлы после обработки.\n\n"
+        "   • другие сайты, поддерживаемые yt-dlp.\n\n"
         "Как пользоваться:\n"
-        "1. Выбери режим ниже (видео или музыка).\n"
+        "1. Выбери режим (видео или музыка).\n"
         "2. Отправь ссылку.\n"
-        "3. Для видео выбери качество, для музыки дождись готового MP3.\n\n"
-        "⚠️ Внимание: если видео весит больше 49 МБ, бот нарежет его на части "
-        "и отправит по очереди — количество частей зависит от размера видео.\n\n"
-        "Важно: YouTube, TikTok и Instagram могут блокировать запросы "
-        "и требовать авторизацию. Скачивай только те материалы, которые "
-        "тебе разрешено сохранять."
+        "3. Для видео выбери качество, для музыки дождись MP3.\n\n"
+        "⚠️ YouTube/TikTok могут блокировать запросы и требовать авторизацию."
     )
     bot.send_message(message.chat.id, intro, reply_markup=main_keyboard())
 
@@ -414,8 +409,7 @@ def cmd_start(message):
 def cmd_cancel(message):
     bot.reply_to(
         message,
-        "Текущая загрузка не может быть мгновенно остановлена этой командой. "
-        "Если она уже идёт, дождись завершения.",
+        "Текущая загрузка не может быть мгновенно остановлена. Дождись завершения.",
         reply_markup=main_keyboard(),
     )
 
@@ -428,34 +422,28 @@ def callback_handler(call):
         if data == "home":
             user_modes.pop(chat_id, None)
             bot.answer_callback_query(call.id)
-            bot.send_message(chat_id, "Главное меню. Что хочешь скачать?", reply_markup=main_keyboard())
+            bot.send_message(chat_id, "Главное меню.", reply_markup=main_keyboard())
         elif data == "help":
             bot.answer_callback_query(call.id)
             bot.send_message(
                 chat_id,
-                "🎬 Видео: отправь ссылку, затем выбери 360p / 480p / 720p / 1080p.\n"
-                "🎵 Музыка: отправь ссылку, бот попробует извлечь аудио и преобразовать его в MP3.\n"
-                "✂️ Большие видео (свыше 49 МБ) автоматически режутся на части по ~45 МБ. "
-                "Количество частей зависит от размера видео.\n\n"
-                "🌐 Поддерживаемые сервисы:\n"
-                "• YouTube\n"
-                "• TikTok\n"
-                "• Instagram\n"
-                "• ВКонтакте (VK Видео)\n"
-                "• Rutube\n"
-                "• и другие сайты, поддерживаемые yt-dlp.\n\n"
-                "Если качество недоступно, выбери вариант ниже. Если файл превышает "
-                "лимит отправки, попробуй более низкое качество. Для MP3 нужен FFmpeg.",
+                "🎬 Видео: ссылка → выбор качества 360p/480p/720p/1080p.\n"
+                "🎵 Музыка: ссылка → MP3.\n"
+                "✂️ Большие видео режутся на части по ~45 МБ.\n\n"
+                "🌐 Сервисы:\n"
+                "• YouTube\n• TikTok\n• Instagram\n• ВК\n• Rutube\n"
+                "• другие (yt-dlp).\n\n"
+                "Для MP3 и нарезки нужен ffmpeg на сервере.",
                 reply_markup=back_keyboard(),
             )
         elif data == "mode:video":
             user_modes[chat_id] = MODE_VIDEO
             bot.answer_callback_query(call.id, "Режим видео включён")
-            bot.send_message(chat_id, "🎬 Отправь ссылку на видео. После проверки я покажу варианты качества.")
+            bot.send_message(chat_id, "🎬 Отправь ссылку на видео.")
         elif data == "mode:audio":
             user_modes[chat_id] = MODE_AUDIO
             bot.answer_callback_query(call.id, "Режим музыки включён")
-            bot.send_message(chat_id, "🎵 Отправь ссылку на видео — я попробую извлечь аудио и отправить MP3.")
+            bot.send_message(chat_id, "🎵 Отправь ссылку — попробую сделать MP3.")
         elif data.startswith("quality:"):
             quality = data.split(":", 1)[1]
             if quality not in VIDEO_QUALITIES:
@@ -465,7 +453,7 @@ def callback_handler(call):
             pending = user_modes.get(chat_id)
             url = pending.get("url") if isinstance(pending, dict) else None
             if not url:
-                bot.send_message(chat_id, "Сначала отправь ссылку на видео.", reply_markup=main_keyboard())
+                bot.send_message(chat_id, "Сначала отправь ссылку.", reply_markup=main_keyboard())
                 return
             user_modes[chat_id] = MODE_VIDEO
             start_job(chat_id, url, MODE_VIDEO, quality)
@@ -474,7 +462,7 @@ def callback_handler(call):
     except Exception:
         log.exception("Callback failed")
         try:
-            bot.answer_callback_query(call.id, "Произошла ошибка", show_alert=True)
+            bot.answer_callback_query(call.id, "Ошибка", show_alert=True)
         except Exception:
             pass
 
@@ -488,44 +476,40 @@ def handle_text(message):
     if not url:
         bot.send_message(
             message.chat.id,
-            "Отправь полную ссылку, начинающуюся с http:// или https://, или выбери режим в меню.",
+            "Отправь ссылку (http:// или https://) или выбери режим.",
             reply_markup=main_keyboard(),
         )
         return
 
     mode = get_mode(message.chat.id)
     if not mode:
-        bot.send_message(
-            message.chat.id,
-            "Сначала выбери, что нужно скачать:",
-            reply_markup=main_keyboard(),
-        )
+        bot.send_message(message.chat.id, "Сначала выбери режим:", reply_markup=main_keyboard())
         return
 
     if mode == MODE_VIDEO:
         user_modes[message.chat.id] = {"mode": MODE_VIDEO, "url": url}
         bot.send_message(
             message.chat.id,
-            "Выбери максимальное качество. Если оно недоступно, загрузчик подберёт доступный формат.",
+            "Выбери качество:",
             reply_markup=quality_keyboard(),
         )
     elif mode == MODE_AUDIO:
         start_job(message.chat.id, url, MODE_AUDIO)
     else:
-        bot.send_message(message.chat.id, "Выбери режим в главном меню.", reply_markup=main_keyboard())
+        bot.send_message(message.chat.id, "Выбери режим в меню.", reply_markup=main_keyboard())
 
 
 def run_bot():
-    log.info("MediaBot запущен; yt-dlp version: %s", yt_dlp.version.__version__)
+    log.info("MediaBot запущен; yt-dlp: %s", yt_dlp.version.__version__)
     while True:
         try:
             bot.infinity_polling(timeout=25, long_polling_timeout=25, skip_pending=True)
-            log.warning("Polling завершился; повторное подключение через 3 секунды")
+            log.warning("Polling завершился; повтор через 3 сек")
         except KeyboardInterrupt:
-            log.info("Бот остановлен вручную")
+            log.info("Остановлен вручную")
             break
         except Exception:
-            log.exception("Ошибка Telegram-соединения; повтор через 5 секунд")
+            log.exception("Ошибка соединения; повтор через 5 сек")
             time.sleep(5)
 
 
