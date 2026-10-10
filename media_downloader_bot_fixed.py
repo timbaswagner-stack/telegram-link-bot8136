@@ -153,6 +153,73 @@ def progress_hook(chat_id, message_id):
             pass
     return hook
 
+def probe_duration(path):
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+def split_video_if_needed(media_file, workdir):
+    """Return parts small enough for Telegram; requires ffmpeg/ffprobe for oversized files."""
+    if media_file.stat().st_size <= MAX_UPLOAD_BYTES:
+        return [media_file]
+    ffmpeg = shutil.which("ffmpeg")
+    duration = probe_duration(media_file)
+    if not ffmpeg or not duration or duration <= 2:
+        raise ValueError(
+            f"Видео весит {media_file.stat().st_size / 1024 / 1024:.1f} МБ, что больше лимита "
+            f"{MAX_UPLOAD_MB} МБ. Для разделения больших видео на сервере нужны FFmpeg и FFprobe."
+        )
+    # Start with 5-minute pieces, then recursively split any piece still too large.
+    initial_seconds = min(300, duration)
+    raw_dir = workdir / "parts_raw"
+    raw_dir.mkdir(exist_ok=True)
+    pattern = raw_dir / "part_%03d.mp4"
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(media_file),
+           "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", str(initial_seconds),
+           "-reset_timestamps", "1", str(pattern)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    parts = sorted(raw_dir.glob("part_*.mp4"))
+    if result.returncode != 0 or not parts:
+        raise RuntimeError("FFmpeg не смог разделить видео: " + (result.stderr or "неизвестная ошибка")[-500:])
+    final_parts = []
+    queue = list(parts)
+    counter = 1
+    while queue:
+        part = queue.pop(0)
+        if part.stat().st_size <= MAX_UPLOAD_BYTES:
+            dest = workdir / f"video_part_{counter:03d}.mp4"
+            if part != dest:
+                shutil.move(str(part), str(dest))
+            final_parts.append(dest)
+            counter += 1
+            continue
+        part_duration = probe_duration(part)
+        if not part_duration or part_duration <= 2:
+            raise ValueError(f"Одна из частей всё ещё больше лимита {MAX_UPLOAD_MB} МБ и не может быть разделена автоматически.")
+        half = part_duration / 2
+        split_dir = workdir / f"split_{counter}_{len(queue)}"
+        split_dir.mkdir(exist_ok=True)
+        children = []
+        for idx, start in enumerate((0, half)):
+            child = split_dir / f"child_{idx}.mp4"
+            segment_cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(start), "-i", str(part),
+                           "-t", str(half), "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero", str(child)]
+            split_result = subprocess.run(segment_cmd, capture_output=True, text=True, timeout=1800)
+            if split_result.returncode == 0 and child.exists() and child.stat().st_size:
+                children.append(child)
+        if len(children) < 2:
+            raise RuntimeError("Не удалось дополнительно разделить слишком большую часть видео.")
+        queue = children + queue
+    return final_parts
+
 def download_media(chat_id, url, mode, quality=None, status_message=None):
     workdir = Path(tempfile.mkdtemp(prefix=f"tg_{chat_id}_", dir=str(DOWNLOAD_DIR)))
     try:
@@ -177,7 +244,6 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                 "no_warnings": True,
                 "restrictfilenames": True,
                 "merge_output_format": "mp4",
-                "max_filesize": MAX_UPLOAD_BYTES,
                 "socket_timeout": 30,
                 "retries": 3,
                 "fragment_retries": 3,
@@ -194,7 +260,6 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                 "quiet": True,
                 "no_warnings": True,
                 "restrictfilenames": True,
-                "max_filesize": MAX_UPLOAD_BYTES,
                 "socket_timeout": 30,
                 "retries": 3,
                 "fragment_retries": 3,
@@ -221,32 +286,28 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
             raise RuntimeError("Загрузчик не создал итоговый файл.")
         # Pick the largest generated file, avoiding sidecar metadata.
         media_file = max(files, key=lambda p: p.stat().st_size)
-        size = media_file.stat().st_size
-        if size > MAX_UPLOAD_BYTES:
-            raise ValueError(
-                f"Файл получился слишком большим ({size / 1024 / 1024:.1f} МБ). "
-                f"Лимит этого бота — {MAX_UPLOAD_MB} МБ. Попробуй качество ниже."
-            )
-
         if status_message:
             try:
-                bot.edit_message_text("📤 Отправляю файл в Telegram…", chat_id, status_message.message_id)
+                bot.edit_message_text("📤 Подготавливаю файл к отправке…", chat_id, status_message.message_id)
             except Exception:
                 pass
 
         caption = f"🎵 {title}" if mode == MODE_AUDIO else f"🎬 {title}\nКачество: {VIDEO_QUALITIES[quality][0]}"
         caption = caption[:1000]
-        with media_file.open("rb") as file_obj:
-            if mode == MODE_AUDIO:
-                bot.send_audio(chat_id, file_obj, caption=caption, title=title[:64], timeout=120)
-            else:
-                bot.send_video(
-                    chat_id,
-                    file_obj,
-                    caption=caption,
-                    supports_streaming=True,
-                    timeout=120,
-                )
+        if mode == MODE_VIDEO:
+            parts = split_video_if_needed(media_file, workdir)
+            if len(parts) > 1:
+                bot.send_message(chat_id, f"ℹ️ Видео превышает лимит Telegram ({MAX_UPLOAD_MB} МБ на файл). Разделил его на {len(parts)} частей и отправляю по очереди.")
+            for index, part in enumerate(parts, 1):
+                part_caption = caption if len(parts) == 1 else f"{caption}\nЧасть {index}/{len(parts)}"
+                with part.open("rb") as file_obj:
+                    bot.send_video(chat_id, file_obj, caption=part_caption[:1000], supports_streaming=True, timeout=180)
+        else:
+            size = media_file.stat().st_size
+            if size > MAX_UPLOAD_BYTES:
+                raise ValueError(f"Аудиофайл слишком большой ({size / 1024 / 1024:.1f} МБ). Лимит — {MAX_UPLOAD_MB} МБ.")
+            with media_file.open("rb") as file_obj:
+                bot.send_audio(chat_id, file_obj, caption=caption, title=title[:64], timeout=180)
         bot.send_message(chat_id, "✅ Готово! Можешь отправить ещё одну ссылку или выбрать режим.", reply_markup=main_keyboard())
 
     except yt_dlp.utils.DownloadError as exc:
@@ -309,12 +370,16 @@ def start_job(chat_id, url, mode, quality=None):
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     intro = (
-        "Привет! Я MediaBot — бот для скачивания видео и аудио по ссылке.\n\n"
+        "Привет! Я MediaFlow136_Not — бот для скачивания видео и аудио по ссылке.\n\n"
+        "Поддерживаемые сервисы зависят от доступности конкретной ссылки и ограничений сайта.\n"
+        "✅ Часто поддерживаются: RuTube и VK Видео.\n"
+        "⚠️ YouTube, TikTok, Instagram, Pinterest и другие сайты могут требовать вход или блокировать облачный сервер; загрузка не гарантируется.\n\n"
         "Что я умею:\n"
         "🎬 Скачивать видео в доступном качестве до 1080p.\n"
         "🎚 Предлагать выбор качества: 360p, 480p, 720p HD или 1080p Full HD.\n"
         "🎵 Извлекать аудио из видео и отправлять его в MP3.\n"
         "🌐 Работать со многими популярными видеосайтами, если они поддерживаются загрузчиком.\n"
+        "🧩 Если видео больше лимита отправки Telegram, попробую разделить его на несколько частей и отправить по очереди. Для этого на сервере нужны FFmpeg и FFprobe.\n"
         "🧹 Удалять временные файлы после обработки.\n\n"
         "Как пользоваться:\n"
         "1. Выбери режим ниже.\n"
