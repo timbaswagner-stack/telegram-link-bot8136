@@ -19,18 +19,19 @@ def ensure_package(module_name, package_name):
 
 ensure_package("telebot", "pyTelegramBotAPI")
 
-# Always refresh yt-dlp at deploy/start. The nightly channel receives fixes
-# for YouTube extractor changes sooner than stable releases.
+# Refresh yt-dlp to the newest available prerelease/nightly at startup.
+# This may help when TikTok/YouTube change their page formats, but cannot
+# guarantee access if the platform blocks the hosting IP or requires login.
 subprocess.check_call([
     __import__("sys").executable, "-m", "pip", "install", "--upgrade",
-    "--disable-pip-version-check", "--pre", "yt-dlp[default]"
+    "--no-cache-dir", "--disable-pip-version-check", "--pre", "yt-dlp[default]"
 ])
 try:
     import yt_dlp_ejs  # noqa: F401
 except ImportError:
     subprocess.check_call([
         __import__("sys").executable, "-m", "pip", "install", "--upgrade",
-        "--disable-pip-version-check", "yt-dlp-ejs"
+        "--no-cache-dir", "--disable-pip-version-check", "yt-dlp-ejs"
     ])
 
 import telebot
@@ -155,6 +156,10 @@ def progress_hook(chat_id, message_id):
 def download_media(chat_id, url, mode, quality=None, status_message=None):
     workdir = Path(tempfile.mkdtemp(prefix=f"tg_{chat_id}_", dir=str(DOWNLOAD_DIR)))
     try:
+        cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+        if cookies_file and not Path(cookies_file).is_file():
+            log.warning("YTDLP_COOKIES_FILE is set but the file does not exist: %s", cookies_file)
+            cookies_file = ""
         if mode == MODE_AUDIO and not is_ffmpeg_available():
             bot.send_message(
                 chat_id,
@@ -173,9 +178,12 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                 "restrictfilenames": True,
                 "merge_output_format": "mp4",
                 "max_filesize": MAX_UPLOAD_BYTES,
-                "socket_timeout": 20,
-                "retries": 2,
-                "fragment_retries": 2,
+                "socket_timeout": 30,
+                "retries": 3,
+                "fragment_retries": 3,
+                "extractor_retries": 5,
+                "file_access_retries": 3,
+                "retry_sleep": {"http": 2, "fragment": 2, "extractor": 2},
                 "progress_hooks": [progress_hook(chat_id, status_message.message_id)] if status_message else [],
             }
         else:
@@ -187,8 +195,12 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                 "no_warnings": True,
                 "restrictfilenames": True,
                 "max_filesize": MAX_UPLOAD_BYTES,
-                "socket_timeout": 20,
-                "retries": 2,
+                "socket_timeout": 30,
+                "retries": 3,
+                "fragment_retries": 3,
+                "extractor_retries": 5,
+                "file_access_retries": 3,
+                "retry_sleep": {"http": 2, "fragment": 2, "extractor": 2},
                 "progress_hooks": [progress_hook(chat_id, status_message.message_id)] if status_message else [],
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
@@ -197,12 +209,12 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
                 }],
             }
 
+        if cookies_file:
+            options["cookiefile"] = cookies_file
+
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
             title = clean_title(info.get("title", "media"))
-            duration = info.get("duration")
-            if duration and duration > 4 * 60 * 60:
-                raise ValueError("Видео длиннее 4 часов — загрузка заблокирована ограничением бота.")
 
         files = [p for p in workdir.iterdir() if p.is_file() and p.stat().st_size > 0]
         if not files:
@@ -238,11 +250,28 @@ def download_media(chat_id, url, mode, quality=None, status_message=None):
         bot.send_message(chat_id, "✅ Готово! Можешь отправить ещё одну ссылку или выбрать режим.", reply_markup=main_keyboard())
 
     except yt_dlp.utils.DownloadError as exc:
-        log.warning("Download failed: %s", exc)
-        message = (
-            "Не удалось скачать этот материал. Возможно, ссылка недоступна, "
-            "сайт изменил защиту, ролик закрыт или формат не поддерживается."
-        )
+        error_text = str(exc)
+        log.warning("Download failed: %s", error_text)
+        lower_error = error_text.lower()
+        if "sign in to confirm" in lower_error or "not a bot" in lower_error:
+            message = (
+                "YouTube отклонил запросы с IP-адреса облачного сервера и требует авторизацию.\n\n"
+                "Это не ошибка Telegram-меню. Обновление yt-dlp не гарантирует решение: "
+                "некоторые облачные IP YouTube блокирует. Нужен доступный для сервера источник/" 
+                "разрешённый файл cookies, если хостинг позволяет безопасно хранить его. "
+                "Не отправляй cookies в чат и не публикуй их на GitHub."
+            )
+        elif any(site in url.lower() for site in ("instagram.com", "tiktok.com")) and any(
+            term in lower_error for term in ("login", "cookies", "private", "challenge", "403", "forbidden")
+        ):
+            message = (
+                "Instagram/TikTok отказал в доступе к этому материалу. Эти сайты часто требуют "
+                "авторизацию или ограничивают запросы с облачных серверов. Проверь, что ссылка "
+                "на публичный ролик и что его разрешено скачивать; бот не может гарантировать "
+                "доступ ко всем публикациям."
+            )
+        else:
+            message = f"Не удалось скачать материал. Ошибка загрузчика: {error_text[:650]}"
         try:
             bot.send_message(chat_id, message, reply_markup=main_keyboard())
         except Exception:
@@ -291,8 +320,9 @@ def cmd_start(message):
         "1. Выбери режим ниже.\n"
         "2. Отправь ссылку на видео.\n"
         "3. Для видео выбери качество, а для музыки дождись готового MP3.\n\n"
-        "Важно: доступность зависит от сайта, самого ролика и ограничений Telegram/облачного сервера. "
-        "Я не обхожу DRM, платный доступ или авторизацию. Скачивай только материалы, которые тебе разрешено сохранять."
+        "Важно: YouTube, TikTok и Instagram могут блокировать запросы с IP облачного сервера или требовать вход. "
+        "Поэтому поддержка не гарантирует скачивание каждого ролика. Я не обхожу DRM, платный доступ или ограничения доступа. "
+        "Скачивай только материалы, которые тебе разрешено сохранять."
     )
     bot.send_message(message.chat.id, intro, reply_markup=main_keyboard())
 
